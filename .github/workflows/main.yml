@@ -1,36 +1,72 @@
-# This is a basic workflow to help you get started with Actions
+name: WAP DevSecOps Progress Code Review
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "master" branch
   push:
-    branches: [ "master" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "master" ]
+    branches: ["main"]
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
-
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+  review-code:
+    # 🔴 CRÍTICO: Diz para o GitHub rodar na sua máquina local (WSL)
+    runs-on: self-hosted 
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      # 1. Baixa o código do repositório
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      # 2. Isola apenas o que mudou (Funciona para Push e para Pull Request)
+      - name: Get PR Diff
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "🤖 Detectado: Evento de Pull Request"
+            git fetch --all
+            git diff origin/${{ github.base_ref }}...HEAD > pr.diff
+          else
+            echo "🚀 Detectado: Evento de Push"
+      
+            if git rev-parse HEAD~1 >/dev/null 2>&1; then
+              git diff HEAD~1 HEAD > pr.diff
+            else
+              git show HEAD > pr.diff
+            fi
+          fi
+      
+          echo "Tamanho do diff:"
+          wc -c pr.diff
+      
+          echo "Primeiras linhas:"
+          head -20 pr.diff
+
+    # 3. Garante que as dependências do Python estão prontas ignorando a trava da PEP 668
+      - name: Set up Python Dependencies
+        run: |
+          pip3 install requests --break-system-packages --quiet
+          pip3 install openai requests --break-system-packages --quiet
+
+      # 4. Executa o script que conversa com o seu Ollama local
+      - name: Run IA Auditor
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+          INPUT_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          DATABRICKS_MODEL: ${{ vars.DATABRICKS_MODEL }}
+        run: |
+          echo "TOKEN=${DATABRICKS_TOKEN:+OK}"
+          echo "HOST=${DATABRICKS_HOST:+OK}"
+          echo "MODEL=${DATABRICKS_MODEL:+OK}"
+          python3 /home/rafaelcanalli/actions_runner/_work/auditar_pr.py
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-check
+          path: code-check.md
+      - name: Publish Summary
+        if: always()
+        run: |
+          cat code-check.md >> $GITHUB_STEP_SUMMARY
