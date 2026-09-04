@@ -74,7 +74,7 @@ jobs:
           RELATORIO_FILE: code-check-ia.md
           METRICAS_FILE: code-check-ia-metrics.json
           OLLAMA_HOST: http://localhost:11434
-          OLLAMA_MODEL: qwen2.5-coder:7b
+          OLLAMA_MODEL: qwen2.5-coder:3b
           # Padrao do Ollama e 4096: acima disso ele trunca o prompt em
           # silencio. Mantenha num_ctx acima do prompt estimado.
           OLLAMA_NUM_CTX: "16384"
