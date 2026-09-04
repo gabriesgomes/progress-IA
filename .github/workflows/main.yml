@@ -6,19 +6,23 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   review-code:
-    # 🔴 CRÍTICO: Diz para o GitHub rodar na sua máquina local (WSL)
-    runs-on: self-hosted 
+    # Runner self-hosted: roda dentro do WSL, onde o Ollama tambem esta.
+    runs-on: self-hosted
 
     steps:
-      # 1. Baixa o código do repositório
+      # 1. Baixa o codigo do repositorio
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2. Isola apenas o que mudou (Funciona para Push e para Pull Request)
+      # 2. Isola apenas o que mudou (funciona para push e para pull request)
       - name: Get PR Diff
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -27,46 +31,87 @@ jobs:
             git diff origin/${{ github.base_ref }}...HEAD > pr.diff
           else
             echo "🚀 Detectado: Evento de Push"
-      
+
             if git rev-parse HEAD~1 >/dev/null 2>&1; then
               git diff HEAD~1 HEAD > pr.diff
             else
               git show HEAD > pr.diff
             fi
           fi
-      
+
           echo "Tamanho do diff:"
           wc -c pr.diff
-      
+
           echo "Primeiras linhas:"
           head -20 pr.diff
 
-    # 3. Garante que as dependências do Python estão prontas ignorando a trava da PEP 668
-      - name: Set up Python Dependencies
-        run: |
-          pip3 install requests --break-system-packages --quiet
-          pip3 install openai requests --break-system-packages --quiet
-
-      # 4. Executa o script que conversa com o seu Ollama local
-      - name: Run IA Auditor
+      # 3. Auditoria estatica: sem IA, sem rede, sem dependencia externa.
+      #    Usa apenas a biblioteca padrao do Python -- nada a instalar.
+      - name: Auditoria estatica (sem IA)
         env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-          INPUT_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
-          DATABRICKS_MODEL: ${{ vars.DATABRICKS_MODEL }}
+          DIFF_FILE: pr.diff
+          RELATORIO_FILE: code-check.md
+          METRICAS_FILE: code-check-metrics.json
+          # Achados detalhados por regra antes de agregar o excedente.
+          LIMITE_POR_REGRA: "15"
+          # Heuristica de blocos: gera falso positivo em massa nos .w do
+          # AppBuilder. Ligue apenas se quiser investigar.
+          CHECAR_BALANCEAMENTO: "0"
+          # Compilacao real do OpenEdge (unica validacao de sintaxe
+          # autoritativa). Requer DLC instalado no runner.
+          PROGRESS_COMPILE: "0"
+          # DLC: /caminho/para/openedge
         run: |
-          echo "TOKEN=${DATABRICKS_TOKEN:+OK}"
-          echo "HOST=${DATABRICKS_HOST:+OK}"
-          echo "MODEL=${DATABRICKS_MODEL:+OK}"
-          python3 /home/rafaelcanalli/actions_runner/_work/auditar_pr.py
-      - name: Upload report
+          python3 "$GITHUB_WORKSPACE/.github/auditar_pr_sem_ia.py"
+
+      # 4. Auditoria por IA: Ollama local, no proprio runner (WSL).
+      #    Sem API key de nuvem. continue-on-error para que indisponibilidade
+      #    do modelo nao derrube o pipeline -- a auditoria estatica ja passou.
+      - name: Auditoria por IA (Ollama local)
+        continue-on-error: true
+        env:
+          DIFF_FILE: pr.diff
+          RELATORIO_FILE: code-check-ia.md
+          METRICAS_FILE: code-check-ia-metrics.json
+          OLLAMA_HOST: http://localhost:11434
+          OLLAMA_MODEL: qwen2.5-coder:7b
+          # Padrao do Ollama e 4096: acima disso ele trunca o prompt em
+          # silencio. Mantenha num_ctx acima do prompt estimado.
+          OLLAMA_NUM_CTX: "16384"
+          OLLAMA_TIMEOUT: "900"
+          # Em CPU, diff grande custa minutos. Ajuste conforme a maquina.
+          LIMITE_DIFF_IA: "20000"
+          # Teto de linhas do mapa de includes no prompt.
+          LIMITE_CONTEXTO_IA: "40"
+          # Preco por milhao de tokens; 0 porque a execucao e local.
+          CUSTO_ENTRADA_1M: "0"
+          CUSTO_SAIDA_1M: "0"
+        run: |
+          python3 "$GITHUB_WORKSPACE/.github/auditar_pr_com_ia.py"
+
+      # 5. Publica os dois relatorios
+      - name: Upload reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: code-check
-          path: code-check.md
+          path: |
+            code-check.md
+            code-check-metrics.json
+            code-check-ia.md
+            code-check-ia-metrics.json
+          if-no-files-found: warn
+
       - name: Publish Summary
         if: always()
         run: |
-          cat code-check.md >> $GITHUB_STEP_SUMMARY
+          if [ -f code-check.md ]; then
+            cat code-check.md >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ -f code-check-ia.md ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            cat code-check-ia.md >> $GITHUB_STEP_SUMMARY
+          fi

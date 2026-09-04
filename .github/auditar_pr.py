@@ -19,7 +19,9 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ==========================================================
@@ -76,6 +78,99 @@ COMPILAR = os.getenv("PROGRESS_COMPILE", "0") == "1" and bool(DLC)
 PROPATH_EXTRA = os.getenv("PROPATH", "")
 
 SEVERIDADES = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
+
+# --- Controle de ruido -------------------------------------------------
+# Includes de produto/framework vivem no PROPATH, fora do repositorio.
+# Referencias a esses prefixos nao sao tratadas como quebradas.
+PREFIXOS_EXTERNOS = tuple(
+    p.strip().lower()
+    for p in os.getenv(
+        "INCLUDES_EXTERNOS",
+        "include/,utp/,method/,adm/,adm2/,src/adm/,cstddk/,prgtec/,"
+        "prgfin/,prgint/,prgcad/,tools/,uft/,btb/,men/,dsc/",
+    ).split(",")
+    if p.strip()
+)
+
+# Achados detalhados por regra. O excedente vira uma linha agregada para o
+# relatorio nao virar ruido ilegivel.
+LIMITE_POR_REGRA = int(os.getenv("LIMITE_POR_REGRA", "15"))
+
+# O balanceamento heuristico acusa falso positivo em massa nos fontes
+# gerados pelo AppBuilder (.w). Desligado por padrao.
+BALANCEAMENTO = os.getenv("CHECAR_BALANCEAMENTO", "0") == "1"
+
+# --- Controle de custo -------------------------------------------------
+# Teto de caracteres do diff enviado a IA.
+LIMITE_DIFF_IA = int(os.getenv("LIMITE_DIFF_IA", "120000"))
+
+# Custo por 1 milhao de tokens (USD). 0 = execucao local (Ollama), sem custo.
+CUSTO_ENTRADA_1M = float(os.getenv("CUSTO_ENTRADA_1M", "0"))
+CUSTO_SAIDA_1M = float(os.getenv("CUSTO_SAIDA_1M", "0"))
+
+# Arquivo de metricas para o pipeline consumir.
+METRICAS_FILE = os.getenv("METRICAS_FILE", "code-check-metrics.json")
+
+# Coletor de telemetria preenchido ao longo da execucao.
+TELEMETRIA = {
+    "tempos": {},
+    "ia": {
+        "chamada": False,
+        "modelo": None,
+        "endpoint": None,
+        "diff_bytes_original": 0,
+        "diff_bytes_enviado": 0,
+        "diff_truncado": False,
+        "tokens_entrada": 0,
+        "tokens_saida": 0,
+        "tokens_total": 0,
+        "custo_usd": 0.0,
+        "erro": None,
+    },
+    "repositorio": {},
+    "achados": {},
+}
+
+
+# ==========================================================
+# INSTRUMENTACAO (TEMPO E CUSTO)
+# ==========================================================
+
+class cronometro:
+    """Mede o tempo de uma etapa e registra em TELEMETRIA['tempos']."""
+
+    def __init__(self, etapa):
+        self.etapa = etapa
+
+    def __enter__(self):
+        self.inicio = time.perf_counter()
+        print(f"[etapa] {self.etapa}: iniciando...")
+        return self
+
+    def __exit__(self, *exc):
+        decorrido = time.perf_counter() - self.inicio
+        TELEMETRIA["tempos"][self.etapa] = round(decorrido, 3)
+        print(f"[etapa] {self.etapa}: {decorrido:.3f}s")
+        return False
+
+
+def estimar_tokens(texto):
+    """
+    Estimativa de tokens sem dependencia externa.
+
+    Aproximacao de ~3.6 caracteres por token, que e o que se observa em
+    codigo-fonte (mais denso em simbolos que texto corrido). Serve para
+    dimensionar custo e evitar estouro de contexto, nao para faturamento.
+    """
+    return max(1, int(len(texto) / 3.6))
+
+
+def calcular_custo(tokens_entrada, tokens_saida):
+    return round(
+        tokens_entrada / 1_000_000 * CUSTO_ENTRADA_1M
+        + tokens_saida / 1_000_000 * CUSTO_SAIDA_1M,
+        6,
+    )
 
 
 # ==========================================================
@@ -755,7 +850,13 @@ def checar_referencia_cruzada(arquivos_alterados, indice):
             )
         )
 
-    # --- referencias quebradas nos fontes alterados ---
+    # --- referencias nao resolvidas nos fontes alterados ---
+    # Includes de produto/framework (PROPATH) sao contabilizados a parte:
+    # nao existem no repositorio por design, e reporta-los individualmente
+    # produziria centenas de falsos positivos.
+    nao_resolvidos = defaultdict(list)
+    externos = defaultdict(int)
+
     for arq in arquivos_alterados:
         if not eh_fonte_progress(arq):
             continue
@@ -771,21 +872,46 @@ def checar_referencia_cruzada(arquivos_alterados, indice):
             if Path(nome).suffix.lower() not in EXT_INCLUDE:
                 continue  # {prog.p} pode ser RUN dinamico, nao include
 
-            achados.append(
-                achado(
-                    "REFERENCIA-CRUZADA", "HIGH",
-                    "Include referenciado nao existe no repositorio",
-                    arq, linha,
-                    f"O fonte referencia `{{{nome}}}`, mas nenhum arquivo "
-                    f"com esse nome foi encontrado no repositorio. Se o "
-                    f"include nao estiver no PROPATH em tempo de "
-                    f"compilacao, o fonte nao compila.",
-                    "Confirme o nome e o caminho do include, ou adicione o "
-                    "arquivo ao repositorio no mesmo PR.",
-                )
-            )
+            if nome.lower().startswith(PREFIXOS_EXTERNOS):
+                externos[nome] += 1
+                continue
 
-    return achados, impactos
+            nao_resolvidos[nome].append((arq, linha))
+
+    if nao_resolvidos:
+        detalhe = []
+        for nome in sorted(nao_resolvidos):
+            locais = nao_resolvidos[nome]
+            amostra = ", ".join(
+                f"`{a}`:{l}" for a, l in locais[:5]
+            )
+            extra = f" (+{len(locais) - 5} outros)" if len(locais) > 5 else ""
+            detalhe.append(f"  - `{{{nome}}}` — {amostra}{extra}")
+
+        achados.append(
+            achado(
+                "REFERENCIA-CRUZADA", "HIGH",
+                f"{len(nao_resolvidos)} include(s) referenciado(s) nao "
+                f"encontrado(s) no repositorio",
+                "(varios)", "-",
+                "Os includes abaixo sao referenciados pelos fontes "
+                "alterados, nao existem no repositorio e nao casam com "
+                "nenhum prefixo de framework conhecido. Se tambem nao "
+                "estiverem no PROPATH, os fontes nao compilam:\n\n"
+                + "\n".join(detalhe),
+                "Confirme nome e caminho de cada include, adicione o "
+                "arquivo ao repositorio, ou inclua o prefixo na variavel "
+                "INCLUDES_EXTERNOS se ele for fornecido pelo produto.",
+            )
+        )
+
+    TELEMETRIA["repositorio"]["includes_externos_distintos"] = len(externos)
+    TELEMETRIA["repositorio"]["includes_externos_ocorrencias"] = sum(
+        externos.values()
+    )
+    TELEMETRIA["repositorio"]["includes_nao_resolvidos"] = len(nao_resolvidos)
+
+    return achados, impactos, dict(externos)
 
 
 def listar_includes_orfaos(indice):
@@ -795,6 +921,57 @@ def listar_includes_orfaos(indice):
         if not indice["usos"].get(base):
             orfaos.extend(str(c) for c in caminhos)
     return sorted(orfaos)
+
+
+def agrupar_achados(achados):
+    """
+    Limita a LIMITE_POR_REGRA os achados detalhados de cada titulo e
+    substitui o excedente por um unico achado agregado.
+
+    Sem isso, uma regra legitima como "DEFINE VARIABLE sem NO-UNDO" produz
+    centenas de entradas identicas e torna o relatorio inutilizavel.
+    """
+    if LIMITE_POR_REGRA <= 0:
+        return achados
+
+    por_titulo = defaultdict(list)
+    for a in achados:
+        por_titulo[a.get("title", "?")].append(a)
+
+    resultado = []
+    for titulo, itens in por_titulo.items():
+        if len(itens) <= LIMITE_POR_REGRA:
+            resultado.extend(itens)
+            continue
+
+        mantidos = itens[:LIMITE_POR_REGRA]
+        excedente = itens[LIMITE_POR_REGRA:]
+        resultado.extend(mantidos)
+
+        arquivos = sorted({i.get("file", "?") for i in excedente})
+        amostra = ", ".join(f"`{a}`" for a in arquivos[:10])
+        extra = (
+            f" e mais {len(arquivos) - 10} arquivo(s)"
+            if len(arquivos) > 10 else ""
+        )
+
+        modelo = itens[0]
+        resultado.append(
+            achado(
+                modelo.get("categoria", "BOAS-PRATICAS"),
+                modelo.get("severity", "LOW"),
+                f"{titulo} — mais {len(excedente)} ocorrencia(s)",
+                "(agregado)", "-",
+                f"Alem das {LIMITE_POR_REGRA} ocorrencias detalhadas acima, "
+                f"o mesmo problema aparece outras {len(excedente)} vezes, "
+                f"distribuidas em {len(arquivos)} arquivo(s): "
+                f"{amostra}{extra}.",
+                "Trate o padrao de forma sistematica em vez de caso a caso. "
+                "Para ver todas as ocorrencias, aumente LIMITE_POR_REGRA.",
+            )
+        )
+
+    return resultado
 
 
 # ==========================================================
@@ -877,21 +1054,62 @@ def montar_contexto_includes(arquivos_alterados, indice, impactos):
     )
 
 
+def truncar_diff(diff):
+    """
+    Limita o diff enviado a IA. Um PR de importacao inicial pode ter
+    megabytes de diff, o que estoura o contexto do modelo e o orcamento.
+    """
+    TELEMETRIA["ia"]["diff_bytes_original"] = len(diff)
+
+    if len(diff) <= LIMITE_DIFF_IA:
+        TELEMETRIA["ia"]["diff_bytes_enviado"] = len(diff)
+        return diff
+
+    cortado = diff[:LIMITE_DIFF_IA]
+    # Corta na ultima fronteira de arquivo para nao entregar diff partido.
+    ultima = cortado.rfind("\ndiff --git ")
+    if ultima > LIMITE_DIFF_IA // 2:
+        cortado = cortado[:ultima]
+
+    aviso = (
+        f"\n\n[TRUNCADO: o diff original tem {len(diff)} bytes; "
+        f"apenas os primeiros {len(cortado)} foram enviados.]\n"
+    )
+    TELEMETRIA["ia"]["diff_bytes_enviado"] = len(cortado)
+    TELEMETRIA["ia"]["diff_truncado"] = True
+    print(f"[custo] Diff truncado: {len(diff)} -> {len(cortado)} bytes "
+          f"(limite LIMITE_DIFF_IA={LIMITE_DIFF_IA})")
+    return cortado + aviso
+
+
 def analisar_com_ia(diff, contexto_includes):
     if not IA_HABILITADA:
         print("[info] IA nao configurada (AI_BASE_URL/AI_MODEL ausentes). "
               "Executando apenas analise estatica.")
+        TELEMETRIA["ia"]["erro"] = "nao configurada"
         return {"summary": "", "findings": []}
 
     try:
         from openai import OpenAI
     except ImportError:
         print("[aviso] Pacote 'openai' nao instalado; IA ignorada.")
+        TELEMETRIA["ia"]["erro"] = "pacote openai ausente"
         return {"summary": "", "findings": []}
+
+    diff_enviado = truncar_diff(diff)
+    prompt = construir_prompt(diff_enviado, contexto_includes)
+
+    tokens_estimados = estimar_tokens(prompt)
+    TELEMETRIA["ia"]["modelo"] = AI_MODEL
+    TELEMETRIA["ia"]["endpoint"] = AI_HOST
+    TELEMETRIA["ia"]["tokens_entrada_estimados"] = tokens_estimados
+    print(f"[custo] Prompt: {len(prompt)} chars, "
+          f"~{tokens_estimados} tokens estimados")
 
     try:
         client = OpenAI(api_key=AI_TOKEN, base_url=AI_HOST)
 
+        inicio = time.perf_counter()
         resposta = client.chat.completions.create(
             model=AI_MODEL,
             temperature=0,
@@ -901,12 +1119,29 @@ def analisar_com_ia(diff, contexto_includes):
                     "content": "Voce e um especialista em Progress OpenEdge "
                                "ABL e revisao de codigo.",
                 },
-                {
-                    "role": "user",
-                    "content": construir_prompt(diff, contexto_includes),
-                },
+                {"role": "user", "content": prompt},
             ],
         )
+        latencia = time.perf_counter() - inicio
+
+        TELEMETRIA["ia"]["chamada"] = True
+        TELEMETRIA["ia"]["latencia_s"] = round(latencia, 3)
+
+        # Prefere o uso reportado pelo provedor; cai na estimativa se ausente.
+        uso = getattr(resposta, "usage", None)
+        entrada = getattr(uso, "prompt_tokens", None) or tokens_estimados
+        saida = getattr(uso, "completion_tokens", None) or 0
+        TELEMETRIA["ia"]["tokens_entrada"] = entrada
+        TELEMETRIA["ia"]["tokens_saida"] = saida
+        TELEMETRIA["ia"]["tokens_total"] = entrada + saida
+        TELEMETRIA["ia"]["uso_reportado"] = uso is not None
+        TELEMETRIA["ia"]["custo_usd"] = calcular_custo(entrada, saida)
+
+        print(f"[custo] Tokens: entrada={entrada} saida={saida} "
+              f"total={entrada + saida}")
+        print(f"[custo] Custo estimado: "
+              f"USD {TELEMETRIA['ia']['custo_usd']:.6f}")
+        print(f"[tempo] Latencia da IA: {latencia:.3f}s")
 
         conteudo = resposta.choices[0].message.content or ""
 
@@ -930,6 +1165,7 @@ def analisar_com_ia(diff, contexto_includes):
 
     except Exception as e:
         print(f"[aviso] Analise por IA falhou: {e}")
+        TELEMETRIA["ia"]["erro"] = str(e)
         return {
             "summary": f"Analise por IA indisponivel ({e}).",
             "findings": [],
@@ -1110,10 +1346,68 @@ def gerar_rodape(indice, arquivos_analisados):
     )
 
 
+def gerar_telemetria():
+    """Seccao de custo e desempenho do relatorio."""
+    tempos = TELEMETRIA["tempos"]
+    ia = TELEMETRIA["ia"]
+    total = round(sum(tempos.values()), 3)
+
+    partes = ["\n## ⏱️ Desempenho e Custo\n\n"]
+
+    partes.append("| Etapa | Tempo |\n|-------|------:|\n")
+    for etapa, seg in tempos.items():
+        partes.append(f"| {etapa} | {seg:.3f}s |\n")
+    partes.append(f"| **TOTAL** | **{total:.3f}s** |\n")
+
+    partes.append("\n| Metrica de IA | Valor |\n|---------------|------:|\n")
+    if ia["chamada"]:
+        partes.append(f"| Modelo | `{ia['modelo']}` |\n")
+        partes.append(f"| Latencia | {ia.get('latencia_s', 0):.3f}s |\n")
+        partes.append(f"| Tokens de entrada | {ia['tokens_entrada']:,} |\n")
+        partes.append(f"| Tokens de saida | {ia['tokens_saida']:,} |\n")
+        partes.append(f"| Tokens totais | {ia['tokens_total']:,} |\n")
+        partes.append(
+            f"| Origem da contagem | "
+            f"{'provedor' if ia.get('uso_reportado') else 'estimativa'} |\n"
+        )
+        partes.append(f"| Custo estimado | USD {ia['custo_usd']:.6f} |\n")
+        partes.append(
+            f"| Diff enviado | {ia['diff_bytes_enviado']:,} de "
+            f"{ia['diff_bytes_original']:,} bytes"
+            + (" ⚠️ truncado" if ia["diff_truncado"] else "")
+            + " |\n"
+        )
+    else:
+        partes.append(
+            f"| Status | Nao executada ({ia.get('erro', 'desconhecido')}) |\n"
+        )
+
+    if CUSTO_ENTRADA_1M == 0 and CUSTO_SAIDA_1M == 0 and ia["chamada"]:
+        partes.append(
+            "\n> Custo exibido como zero porque `CUSTO_ENTRADA_1M` e "
+            "`CUSTO_SAIDA_1M` nao foram definidos. Em execucao local "
+            "(Ollama) isso esta correto; para endpoint pago, defina as "
+            "duas variaveis com o preco por milhao de tokens.\n"
+        )
+
+    return "".join(partes)
+
+
 def escrever_relatorio(conteudo):
     with open(RELATORIO_FILE, "w", encoding="utf-8") as f:
         f.write(conteudo)
     print(f"[ok] Relatorio salvo em {RELATORIO_FILE}")
+
+
+def escrever_metricas():
+    """Grava as metricas em JSON para o pipeline consumir."""
+    TELEMETRIA["gerado_em"] = datetime.now(timezone.utc).isoformat()
+    TELEMETRIA["tempo_total_s"] = round(
+        sum(TELEMETRIA["tempos"].values()), 3
+    )
+    with open(METRICAS_FILE, "w", encoding="utf-8") as f:
+        json.dump(TELEMETRIA, f, indent=2, ensure_ascii=False)
+    print(f"[ok] Metricas salvas em {METRICAS_FILE}")
 
 
 # ==========================================================
@@ -1132,6 +1426,7 @@ def main():
             )
             print(relatorio)
             escrever_relatorio(relatorio)
+            escrever_metricas()
             return 0
 
         adicoes_por_arquivo = parsear_diff(diff)
@@ -1154,47 +1449,84 @@ def main():
             )
             print(relatorio)
             escrever_relatorio(relatorio)
+            escrever_metricas()
             return 0
 
-        print("[info] Indexando repositorio...")
-        indice = indexar_repositorio()
+        with cronometro("indexacao do repositorio"):
+            indice = indexar_repositorio()
         print(f"[ok] {len(indice['fontes'])} fontes, "
               f"{len(indice['includes'])} includes indexados")
+
+        TELEMETRIA["repositorio"].update({
+            "fontes_indexados": len(indice["fontes"]),
+            "includes_catalogados": len(indice["includes"]),
+            "arquivos_no_diff": len(adicoes_por_arquivo),
+            "fontes_progress_no_diff": len(arquivos_progress),
+            "diff_bytes": len(diff),
+            "linhas_adicionadas": sum(
+                len(v) for v in adicoes_por_arquivo.values()
+            ),
+        })
 
         achados = []
 
         # 1) hard-code e boas praticas nas linhas adicionadas
-        for arq in arquivos_progress:
-            adicoes = adicoes_por_arquivo[arq]
-            achados += checar_hardcode(arq, adicoes)
-            achados += checar_boas_praticas(arq, adicoes)
+        with cronometro("hard-code e boas praticas"):
+            for arq in arquivos_progress:
+                adicoes = adicoes_por_arquivo[arq]
+                achados += checar_hardcode(arq, adicoes)
+                achados += checar_boas_praticas(arq, adicoes)
 
-        # 2) sintaxe: balanceamento no arquivo completo
-        for arq in arquivos_progress:
-            caminho = REPO_ROOT / arq
-            if caminho.exists():
-                achados += checar_balanceamento(arq, ler_arquivo(caminho))
+        # 2) sintaxe: balanceamento (opcional, ver BALANCEAMENTO)
+        if BALANCEAMENTO:
+            with cronometro("balanceamento de blocos"):
+                for arq in arquivos_progress:
+                    caminho = REPO_ROOT / arq
+                    if caminho.exists():
+                        achados += checar_balanceamento(
+                            arq, ler_arquivo(caminho)
+                        )
+        else:
+            print("[info] Balanceamento heuristico desligado "
+                  "(CHECAR_BALANCEAMENTO=1 para habilitar).")
 
         # 2b) sintaxe: compilacao real (opcional)
-        achados += compilar_com_openedge(arquivos_progress)
+        if COMPILAR:
+            with cronometro("compilacao OpenEdge"):
+                achados += compilar_com_openedge(arquivos_progress)
 
         # 3) referencia cruzada de includes
-        achados_ref, impactos = checar_referencia_cruzada(
-            arquivos_progress, indice
-        )
-        achados += achados_ref
-        orfaos = listar_includes_orfaos(indice)
+        with cronometro("referencia cruzada"):
+            achados_ref, impactos, externos = checar_referencia_cruzada(
+                arquivos_progress, indice
+            )
+            achados += achados_ref
+            orfaos = listar_includes_orfaos(indice)
+
+        print(f"[info] Includes de framework ignorados: "
+              f"{len(externos)} distintos, {sum(externos.values())} usos")
 
         # 4) IA complementar
-        contexto = montar_contexto_includes(
-            arquivos_progress, indice, impactos
-        )
-        resultado_ia = analisar_com_ia(diff, contexto)
-        achados += resultado_ia["findings"]
+        with cronometro("analise por IA"):
+            contexto = montar_contexto_includes(
+                arquivos_progress, indice, impactos
+            )
+            resultado_ia = analisar_com_ia(diff, contexto)
+            achados += resultado_ia["findings"]
+
+        TELEMETRIA["achados"]["brutos"] = len(achados)
+        achados = agrupar_achados(achados)
+        TELEMETRIA["achados"]["apos_agrupamento"] = len(achados)
 
         metricas = calcular_metricas(achados)
         categorias = calcular_por_categoria(achados)
         score = calcular_score(metricas)
+
+        TELEMETRIA["achados"].update({
+            "por_severidade": {s: metricas[s] for s in SEVERIDADES},
+            "por_categoria": categorias,
+            "score": score,
+        })
 
         resumo_ia = resultado_ia.get("summary", "").strip()
         resumo = resumo_ia or (
@@ -1211,11 +1543,27 @@ def main():
             f"**{score}** _(quanto menor, melhor)_\n"
             f"{gerar_mapa_includes(impactos, orfaos)}"
             f"{gerar_detalhamento(achados)}"
+            f"{gerar_telemetria()}"
             f"{gerar_rodape(indice, arquivos_progress)}"
         )
 
-        print(relatorio)
         escrever_relatorio(relatorio)
+        escrever_metricas()
+
+        # Resumo enxuto no stdout. O relatorio completo vai para o arquivo:
+        # imprimi-lo aqui gera megabytes de log e quebra em pipe fechado.
+        print("\n" + "=" * 58)
+        print("RESUMO DA AUDITORIA")
+        print("=" * 58)
+        for sev in SEVERIDADES:
+            print(f"  {sev:<10} {metricas[sev]:>6}")
+        print(f"  {'TOTAL':<10} {metricas['TOTAL']:>6}")
+        print(f"  Score      {score:>6}")
+        print(f"  Tempo      {TELEMETRIA['tempo_total_s']:>6.2f}s")
+        if TELEMETRIA["ia"]["chamada"]:
+            print(f"  Tokens     {TELEMETRIA['ia']['tokens_total']:>6,}")
+            print(f"  Custo      USD {TELEMETRIA['ia']['custo_usd']:.6f}")
+        print("=" * 58)
 
         # Falha o job apenas se houver CRITICAL, e somente quando pedido.
         if metricas["CRITICAL"] > 0 and os.getenv("FALHAR_SE_CRITICO") == "1":
