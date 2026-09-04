@@ -45,7 +45,8 @@ from auditoria_comum import (
 # ==========================================================
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL")
+#OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
 
 # O padrao do Ollama e 4096 tokens. Acima disso ele TRUNCA o prompt em
 # silencio e o modelo responde sobre um pedaco arbitrario do codigo.
