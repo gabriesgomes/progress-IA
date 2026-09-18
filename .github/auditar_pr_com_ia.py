@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 """
-Auditoria de codigo Progress 4GL (OpenEdge ABL) -- COM IA (Ollama local).
+Auditoria de codigo Progress 4GL (OpenEdge ABL) -- COM IA (Databricks).
 
-Envia o diff e o mapa de includes para um modelo servido pelo Ollama que
-roda na propria maquina (WSL) e transforma a resposta em achados no mesmo
-formato de relatorio da execucao sem IA.
+Envia o diff e o mapa de includes para um endpoint de serving do Databricks
+usando o SDK da OpenAI, e transforma a resposta em achados no mesmo formato
+de relatorio da execucao sem IA.
 
-Fala com a API nativa do Ollama (/api/chat) usando apenas urllib da
-biblioteca padrao: sem pacote openai, sem API key de nuvem.
+So e executado pelo workflow quando a checagem de sintaxe pelo compilador
+Progress passa -- ver progress_compilador.py e main.yml.
 
-Variaveis de ambiente:
-  OLLAMA_HOST      endpoint base      (padrao http://localhost:11434)
-  OLLAMA_MODEL     modelo             (padrao qwen2.5-coder:7b)
-  OLLAMA_NUM_CTX   janela de contexto (padrao 8192)
-  OLLAMA_TIMEOUT   timeout em s       (padrao 900)
-  LIMITE_DIFF_IA   teto de caracteres do diff enviado
+Variaveis de ambiente (vindas dos secrets/variables do GitHub):
+  DATABRICKS_HOST   URL do workspace ou do endpoint de serving.
+                    Se vier so o workspace, '/serving-endpoints' e
+                    acrescentado automaticamente.
+  DATABRICKS_TOKEN  Personal access token do Databricks (secret).
+  DATABRICKS_MODEL  Nome do serving endpoint / modelo.
+
+  LIMITE_DIFF_IA    Teto de caracteres do diff enviado.
+  CUSTO_ENTRADA_1M  Preco por milhao de tokens de entrada (USD).
+  CUSTO_SAIDA_1M    Preco por milhao de tokens de saida (USD).
+  IA_TIMEOUT        Timeout da chamada em segundos (padrao 300).
+  IA_MAX_TOKENS     Teto de tokens da resposta (padrao 4096).
+
+Requer o pacote 'openai' instalado no runner.
 
 Gera code-check.md (configuravel por RELATORIO_FILE).
 """
@@ -23,8 +31,6 @@ import json
 import os
 import sys
 import time
-import urllib.error
-import urllib.request
 
 from auditoria_comum import (
     LIMITE_DIFF_IA,
@@ -41,19 +47,52 @@ from auditoria_comum import (
 )
 
 # ==========================================================
-# CONFIGURACAO DO OLLAMA LOCAL
+# CONFIGURACAO DO DATABRICKS
 # ==========================================================
 
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL")
-#OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
+DATABRICKS_HOST = os.getenv("DATABRICKS_HOST", "").strip().rstrip("/")
+DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN", "").strip()
+DATABRICKS_MODEL = os.getenv("DATABRICKS_MODEL", "").strip()
 
-# O padrao do Ollama e 4096 tokens. Acima disso ele TRUNCA o prompt em
-# silencio e o modelo responde sobre um pedaco arbitrario do codigo.
-OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+IA_TIMEOUT = int(os.getenv("IA_TIMEOUT", "300"))
+IA_MAX_TOKENS = int(os.getenv("IA_MAX_TOKENS", "4096"))
 
-# Em CPU um modelo 7B leva minutos para processar milhares de tokens.
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "900"))
+
+def resolver_base_url(host):
+    """
+    O cliente OpenAI espera a URL do endpoint de serving.
+
+    Passar apenas a URL do workspace resulta em 404 -- erro comum e de
+    diagnostico dificil, entao normalizamos aqui.
+    """
+    if not host:
+        return ""
+    if host.endswith("/serving-endpoints"):
+        return host
+    if "/serving-endpoints" in host:
+        return host
+    return f"{host}/serving-endpoints"
+
+
+BASE_URL = resolver_base_url(DATABRICKS_HOST)
+
+
+def validar_configuracao():
+    """Falha cedo e com mensagem clara em vez de 401/404 opaco."""
+    faltando = [
+        nome for nome, valor in (
+            ("DATABRICKS_HOST", DATABRICKS_HOST),
+            ("DATABRICKS_TOKEN", DATABRICKS_TOKEN),
+            ("DATABRICKS_MODEL", DATABRICKS_MODEL),
+        ) if not valor
+    ]
+
+    if faltando:
+        raise RuntimeError(
+            "Variaveis obrigatorias nao definidas: "
+            + ", ".join(faltando)
+            + ". Configure-as em Settings > Secrets and variables > Actions."
+        )
 
 
 # ==========================================================
@@ -81,11 +120,14 @@ def construir_prompt(diff, contexto_includes):
     return (
         "Voce e um especialista em Progress OpenEdge ABL (4GL) fazendo code "
         "review de um Pull Request.\n\n"
+        "O codigo JA PASSOU pela compilacao do OpenEdge, entao erro de "
+        "sintaxe elementar ja foi descartado. Concentre-se em problemas "
+        "que o compilador nao pega.\n\n"
         "Analise SOMENTE as linhas ADICIONADAS do diff (prefixo '+').\n\n"
         "Procure problemas de:\n"
-        "1. SINTAXE - blocos DO/FOR/REPEAT/CASE sem END, ausencia de ponto "
-        "final, END sobrando, uso incorreto de preprocessador "
-        "({&PARAM}, {1}), parametros de include incompativeis.\n"
+        "1. SINTAXE - construcoes que compilam mas estao erradas na "
+        "pratica: uso incorreto de preprocessador ({&PARAM}, {1}), "
+        "parametros de include incompativeis, escopo de bloco enganoso.\n"
         "2. HARD-CODE - caminhos de arquivo, IPs, URLs, e-mails, senhas, "
         "datas, codigos de empresa/estabelecimento e demais literais que "
         "deveriam vir de parametro ou configuracao.\n"
@@ -112,7 +154,7 @@ def construir_prompt(diff, contexto_includes):
 def truncar_diff(diff):
     """
     Limita o diff enviado ao modelo. Um PR de importacao inicial pode ter
-    megabytes de diff, o que estoura a janela de contexto.
+    megabytes de diff, o que estoura a janela de contexto e o orcamento.
     """
     TELEMETRIA["ia"]["diff_bytes_original"] = len(diff)
 
@@ -138,96 +180,11 @@ def truncar_diff(diff):
 
 
 # ==========================================================
-# CHAMADA AO OLLAMA
+# CHAMADA AO DATABRICKS
 # ==========================================================
 
-def verificar_ollama():
-    """
-    Confirma que o servico responde e que o modelo esta baixado.
-
-    Falhar aqui com mensagem clara e melhor que receber um 404 opaco no
-    meio da geracao.
-    """
-    try:
-        with urllib.request.urlopen(
-            f"{OLLAMA_HOST}/api/tags", timeout=15
-        ) as r:
-            dados = json.loads(r.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
-        raise RuntimeError(
-            f"Ollama nao respondeu em {OLLAMA_HOST}: {e}. "
-            f"Verifique se o servico esta ativo (systemctl status ollama)."
-        )
-
-    modelos = [m.get("name", "") for m in dados.get("models", [])]
-    if not modelos:
-        raise RuntimeError(
-            f"Ollama esta ativo em {OLLAMA_HOST}, mas nenhum modelo foi "
-            f"baixado. Rode: ollama pull {OLLAMA_MODEL}"
-        )
-
-    # O Ollama aceita 'modelo' como apelido de 'modelo:latest'.
-    if not any(
-        m == OLLAMA_MODEL or m.split(":")[0] == OLLAMA_MODEL.split(":")[0]
-        for m in modelos
-    ):
-        raise RuntimeError(
-            f"Modelo '{OLLAMA_MODEL}' nao esta disponivel. "
-            f"Modelos presentes: {', '.join(modelos)}. "
-            f"Rode: ollama pull {OLLAMA_MODEL}"
-        )
-
-    print(f"[ok] Ollama respondeu em {OLLAMA_HOST}; "
-          f"modelos: {', '.join(modelos)}")
-
-
-def chamar_ollama(prompt):
-    """
-    POST /api/chat com format=json. Retorna (conteudo, uso).
-
-    O Ollama devolve prompt_eval_count e eval_count, que sao contagens
-    reais de token -- melhores que a estimativa por caractere.
-    """
-    corpo = json.dumps({
-        "model": OLLAMA_MODEL,
-        "stream": False,
-        "format": "json",
-        "options": {
-            "temperature": 0,
-            "num_ctx": OLLAMA_NUM_CTX,
-        },
-        "messages": [
-            {
-                "role": "system",
-                "content": "Voce e um especialista em Progress OpenEdge ABL "
-                           "e revisao de codigo. Responda apenas com JSON.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-    }).encode("utf-8")
-
-    requisicao = urllib.request.Request(
-        f"{OLLAMA_HOST}/api/chat",
-        data=corpo,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    with urllib.request.urlopen(
-        requisicao, timeout=OLLAMA_TIMEOUT
-    ) as resposta:
-        dados = json.loads(resposta.read().decode("utf-8"))
-
-    conteudo = (dados.get("message") or {}).get("content", "")
-    uso = {
-        "prompt_tokens": dados.get("prompt_eval_count"),
-        "completion_tokens": dados.get("eval_count"),
-    }
-    return conteudo, uso
-
-
 def extrair_json(conteudo):
-    """Tolera texto ao redor do JSON, que modelos pequenos costumam emitir."""
+    """Tolera texto ao redor do JSON, que alguns modelos emitem."""
     try:
         return json.loads(conteudo)
     except json.JSONDecodeError:
@@ -243,43 +200,67 @@ def analisar_com_ia(diff, contexto_includes):
     prompt = construir_prompt(diff_enviado, contexto_includes)
 
     tokens_estimados = estimar_tokens(prompt)
-    TELEMETRIA["ia"]["modelo"] = OLLAMA_MODEL
-    TELEMETRIA["ia"]["endpoint"] = OLLAMA_HOST
-    TELEMETRIA["ia"]["num_ctx"] = OLLAMA_NUM_CTX
+    TELEMETRIA["ia"]["modelo"] = DATABRICKS_MODEL or None
+    TELEMETRIA["ia"]["endpoint"] = BASE_URL or None
     TELEMETRIA["ia"]["tokens_entrada_estimados"] = tokens_estimados
 
     print(f"[custo] Prompt: {len(prompt)} chars, "
           f"~{tokens_estimados} tokens estimados")
 
-    if tokens_estimados > OLLAMA_NUM_CTX:
-        print(f"[aviso] Prompt estimado (~{tokens_estimados} tokens) excede "
-              f"num_ctx={OLLAMA_NUM_CTX}. O Ollama vai truncar em silencio. "
-              f"Reduza LIMITE_DIFF_IA ou aumente OLLAMA_NUM_CTX.")
-
     try:
-        verificar_ollama()
+        validar_configuracao()
+
+        from openai import OpenAI
+
+        cliente = OpenAI(
+            api_key=DATABRICKS_TOKEN,
+            base_url=BASE_URL,
+            timeout=IA_TIMEOUT,
+        )
+
+        print(f"[info] Endpoint: {BASE_URL}")
+        print(f"[info] Modelo  : {DATABRICKS_MODEL}")
 
         inicio = time.perf_counter()
-        conteudo, uso = chamar_ollama(prompt)
+        resposta = cliente.chat.completions.create(
+            model=DATABRICKS_MODEL,
+            temperature=0,
+            max_tokens=IA_MAX_TOKENS,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Voce e um especialista em Progress OpenEdge "
+                               "ABL e revisao de codigo. Responda apenas "
+                               "com JSON valido.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
         latencia = time.perf_counter() - inicio
 
         TELEMETRIA["ia"]["chamada"] = True
         TELEMETRIA["ia"]["latencia_s"] = round(latencia, 3)
 
-        entrada = uso.get("prompt_tokens") or tokens_estimados
-        saida = uso.get("completion_tokens") or 0
+        # Prefere o uso reportado pelo provedor; cai na estimativa se ausente.
+        uso = getattr(resposta, "usage", None)
+        entrada = getattr(uso, "prompt_tokens", None) or tokens_estimados
+        saida = getattr(uso, "completion_tokens", None) or 0
+
         TELEMETRIA["ia"]["tokens_entrada"] = entrada
         TELEMETRIA["ia"]["tokens_saida"] = saida
         TELEMETRIA["ia"]["tokens_total"] = entrada + saida
-        TELEMETRIA["ia"]["uso_reportado"] = uso.get("prompt_tokens") is not None
+        TELEMETRIA["ia"]["uso_reportado"] = (
+            getattr(uso, "prompt_tokens", None) is not None
+        )
         TELEMETRIA["ia"]["custo_usd"] = calcular_custo(entrada, saida)
 
         print(f"[custo] Tokens: entrada={entrada} saida={saida} "
               f"total={entrada + saida}")
         print(f"[custo] Custo estimado: "
               f"USD {TELEMETRIA['ia']['custo_usd']:.6f}")
-        print(f"[tempo] Latencia do Ollama: {latencia:.3f}s")
+        print(f"[tempo] Latencia da IA: {latencia:.3f}s")
 
+        conteudo = resposta.choices[0].message.content or ""
         dados = extrair_json(conteudo)
 
         itens = dados.get("findings") or dados.get("vulnerabilities") or []
@@ -291,6 +272,18 @@ def analisar_com_ia(diff, contexto_includes):
 
         print(f"[ok] Modelo retornou {len(itens)} achado(s)")
         return {"summary": dados.get("summary", ""), "findings": itens}
+
+    except ImportError:
+        motivo = (
+            "pacote 'openai' nao instalado no runner "
+            "(pip3 install openai --break-system-packages)"
+        )
+        print(f"[aviso] Analise por IA falhou: {motivo}")
+        TELEMETRIA["ia"]["erro"] = motivo
+        return {
+            "summary": f"Analise por IA indisponivel ({motivo}).",
+            "findings": [],
+        }
 
     except Exception as e:
         print(f"[aviso] Analise por IA falhou: {e}")
@@ -307,7 +300,7 @@ def analisar_com_ia(diff, contexto_includes):
 
 def main():
     try:
-        contexto = preparar_execucao("com IA (Ollama local)")
+        contexto = preparar_execucao("com IA (Databricks)")
         if contexto is None:
             return 0
 
@@ -323,9 +316,10 @@ def main():
             resultado = analisar_com_ia(diff, contexto_includes)
 
         rodape = [
-            f"- Endpoint Ollama: `{OLLAMA_HOST}`\n",
-            f"- Modelo: `{OLLAMA_MODEL}`\n",
-            f"- Janela de contexto: **{OLLAMA_NUM_CTX}** tokens\n",
+            f"- Endpoint Databricks: `{BASE_URL or 'nao configurado'}`\n",
+            f"- Modelo: `{DATABRICKS_MODEL or 'nao configurado'}`\n",
+            "- Sintaxe: validada previamente pelo compilador OpenEdge "
+            "(ver relatorio da auditoria estatica)\n",
             "- Checagens estaticas: **nao se aplicam a este modo** "
             "(ver `auditar_pr_sem_ia.py`)\n\n",
             "> Achados desta execucao vem de um modelo de linguagem e "

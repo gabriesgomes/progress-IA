@@ -2,9 +2,13 @@ name: WAP DevSecOps Progress Code Review
 
 on:
   push:
-    branches: ["master"]
+    # O repositorio usa 'master'. 'main' fica listado para o caso de
+    # renomeacao futura do branch padrao.
+    branches: ["master", "main"]
   pull_request:
-    branches: ["master"]
+    branches: ["master", "main"]
+  # Permite disparar a mao pela aba Actions, sem precisar de commit.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,7 +16,7 @@ permissions:
 
 jobs:
   review-code:
-    # Runner self-hosted: roda dentro do WSL, onde o Ollama tambem esta.
+    # Runner self-hosted rodando no WSL local.
     runs-on: self-hosted
 
     steps:
@@ -45,51 +49,129 @@ jobs:
           echo "Primeiras linhas:"
           head -20 pr.diff
 
-      # 3. Auditoria estatica: sem IA, sem rede, sem dependencia externa.
+      # 2b. Materializa a chave SSH do servidor Progress a partir do secret.
+      #     A chave nunca aparece no log: e escrita direto em arquivo com
+      #     permissao 600 e apagada no fim do job.
+      - name: Preparar chave SSH do servidor Progress
+        if: ${{ secrets.PROGRESS_SSH_KEY != '' }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.ssh-progress"
+          chmod 700 "$GITHUB_WORKSPACE/.ssh-progress"
+          printf '%s\n' "${{ secrets.PROGRESS_SSH_KEY }}" \
+            > "$GITHUB_WORKSPACE/.ssh-progress/id_rsa"
+          chmod 600 "$GITHUB_WORKSPACE/.ssh-progress/id_rsa"
+          echo "Chave gravada ($(wc -c < "$GITHUB_WORKSPACE/.ssh-progress/id_rsa") bytes)"
+
+      # 3. Auditoria estatica + validacao de SINTAXE pelo compilador Progress.
       #    Usa apenas a biblioteca padrao do Python -- nada a instalar.
-      - name: Auditoria estatica (sem IA)
+      #    O resultado da compilacao e o portao da etapa 5.
+      #
+      #    >>> CONFIGURE AQUI O COMPILADOR <<<
+      #    Basta preencher DLC e PROGRESS_PF e trocar PROGRESS_COMPILE
+      #    para "1". Detalhes de cada variavel em progress_compilador.py.
+      - name: Auditoria estatica e sintaxe (compilador Progress)
+        id: estatica
         env:
           DIFF_FILE: pr.diff
           RELATORIO_FILE: code-check.md
           METRICAS_FILE: code-check-metrics.json
-          # Achados detalhados por regra antes de agregar o excedente.
-          LIMITE_POR_REGRA: "15"
-          # Heuristica de blocos: gera falso positivo em massa nos .w do
-          # AppBuilder. Ligue apenas se quiser investigar.
-          CHECAR_BALANCEAMENTO: "0"
-          # Compilacao real do OpenEdge (unica validacao de sintaxe
-          # autoritativa). Requer DLC instalado no runner.
+
+          # --- Compilador OpenEdge -------------------------------------
+          # Troque para "1" quando o restante estiver preenchido.
           PROGRESS_COMPILE: "0"
-          # DLC: /caminho/para/openedge
+          # "local" = OpenEdge no proprio runner.
+          # "ssh"   = OpenEdge em outro servidor (caso desta instalacao).
+          PROGRESS_EXEC_MODE: "ssh"
+
+          # Caminhos NO SERVIDOR REMOTO quando o modo e ssh.
+          # Raiz da instalacao OpenEdge. Ex.: /usr/dlc
+          DLC: ""
+          # Binario alternativo, se nao for $DLC/bin/_progres.
+          PROGRES_BIN: ""
+          # Arquivo .pf com a conexao ao banco. Sem banco, fonte que
+          # referencia tabela nao compila.
+          PROGRESS_PF: ""
+          # Parametros extras. Ex.: "-cpinternal iso8859-1 -cpstream iso8859-1"
+          PROGRESS_PARAMS: ""
+          # PROPATH adicional (includes de produto fora do repositorio),
+          # separado por virgula. A raiz dos fontes ja entra automaticamente.
+          PROPATH: ""
+          PROGRESS_TIMEOUT: "900"
+          # "1" barra a IA tambem quando a compilacao nao pode ser executada.
+          EXIGIR_COMPILACAO: "0"
+
+          # --- Staging do r-code ---------------------------------------
+          # "1" grava o .r; "0" apenas valida a sintaxe e descarta.
+          PROGRESS_SAVE_RCODE: "0"
+          # Diretorio de staging NO SERVIDOR. Precisa estar FORA do
+          # PROPATH: o script recusa a gerar se detectar sobreposicao.
+          # Ex.: /staging/rcode/wms
+          PROGRESS_RCODE_DIR: ""
+          # Permissao final. O padrao permite copiar e impede alterar.
+          PROGRESS_RCODE_MODE_DIR: "755"
+          PROGRESS_RCODE_MODE_FILE: "444"
+
+          # --- Acesso SSH ao servidor Progress -------------------------
+          PROGRESS_SSH_HOST: ${{ vars.PROGRESS_SSH_HOST }}
+          PROGRESS_SSH_USER: ${{ vars.PROGRESS_SSH_USER }}
+          PROGRESS_SSH_PORT: "22"
+          # Caminho da chave privada NO RUNNER. Veja o step anterior, que
+          # a materializa a partir do secret.
+          PROGRESS_SSH_KEY: ${{ github.workspace }}/.ssh-progress/id_rsa
+          PROGRESS_REMOTE_TMP: "/tmp"
+
+          # --- Ruido do relatorio --------------------------------------
+          LIMITE_POR_REGRA: "15"
+          # Heuristica de blocos: falso positivo em massa nos .w do
+          # AppBuilder. Desnecessaria quando o compilador esta ativo.
+          CHECAR_BALANCEAMENTO: "0"
         run: |
           python3 "$GITHUB_WORKSPACE/.github/auditar_pr_sem_ia.py"
 
-      # 4. Auditoria por IA: Ollama local, no proprio runner (WSL).
-      #    Sem API key de nuvem. continue-on-error para que indisponibilidade
-      #    do modelo nao derrube o pipeline -- a auditoria estatica ja passou.
-      - name: Auditoria por IA (Ollama local)
+      # 4. Dependencia da etapa de IA. Ignora a trava da PEP 668.
+      - name: Set up Python Dependencies
+        if: steps.estatica.outputs.prosseguir_ia == 'true'
+        run: |
+          pip3 install openai --break-system-packages --quiet
+
+      # 5. Auditoria por IA no Databricks -- so roda se a sintaxe passou.
+      - name: Auditoria por IA (Databricks)
+        if: steps.estatica.outputs.prosseguir_ia == 'true'
         continue-on-error: true
         env:
           DIFF_FILE: pr.diff
           RELATORIO_FILE: code-check-ia.md
           METRICAS_FILE: code-check-ia-metrics.json
-          OLLAMA_HOST: http://localhost:11434
-          OLLAMA_MODEL: qwen2.5-coder:3b
-          # Padrao do Ollama e 4096: acima disso ele trunca o prompt em
-          # silencio. Mantenha num_ctx acima do prompt estimado.
-          OLLAMA_NUM_CTX: "16384"
-          OLLAMA_TIMEOUT: "900"
-          # Em CPU, diff grande custa minutos. Ajuste conforme a maquina.
-          LIMITE_DIFF_IA: "20000"
-          # Teto de linhas do mapa de includes no prompt.
+
+          # --- Databricks ----------------------------------------------
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          DATABRICKS_MODEL: ${{ vars.DATABRICKS_MODEL }}
+
+          IA_TIMEOUT: "300"
+          IA_MAX_TOKENS: "4096"
+
+          # --- Custo e tamanho -----------------------------------------
+          LIMITE_DIFF_IA: "60000"
           LIMITE_CONTEXTO_IA: "40"
-          # Preco por milhao de tokens; 0 porque a execucao e local.
+          # Preco por milhao de tokens do endpoint. Preencha para o custo
+          # aparecer correto no relatorio.
           CUSTO_ENTRADA_1M: "0"
           CUSTO_SAIDA_1M: "0"
         run: |
+          echo "TOKEN=${DATABRICKS_TOKEN:+OK}"
+          echo "HOST=${DATABRICKS_HOST:+OK}"
+          echo "MODEL=${DATABRICKS_MODEL:+OK}"
           python3 "$GITHUB_WORKSPACE/.github/auditar_pr_com_ia.py"
 
-      # 5. Publica os dois relatorios
+      # 6. Remove a chave SSH do disco do runner. Runner self-hosted nao
+      #    descarta o workspace entre jobs, entao a limpeza e necessaria.
+      - name: Remover chave SSH
+        if: always()
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/.ssh-progress"
+
+      # 7. Publica os relatorios gerados
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -105,6 +187,9 @@ jobs:
       - name: Publish Summary
         if: always()
         run: |
+          echo "### Status da sintaxe: \`${{ steps.estatica.outputs.compilacao_status }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
           if [ -f code-check.md ]; then
             cat code-check.md >> $GITHUB_STEP_SUMMARY
           fi
@@ -114,4 +199,7 @@ jobs:
             echo "---" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             cat code-check-ia.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> Etapa de IA nao executada (sintaxe nao liberou o portao)." >> $GITHUB_STEP_SUMMARY
           fi

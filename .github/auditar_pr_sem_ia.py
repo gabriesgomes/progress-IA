@@ -17,14 +17,13 @@ Usa apenas a biblioteca padrao do Python -- nao requer pip install.
 Gera code-check.md (configuravel por RELATORIO_FILE).
 """
 
-import json
 import os
 import re
-import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
 
+import progress_compilador
 from auditoria_comum import (
     EXT_INCLUDE,
     PREFIXOS_EXTERNOS,
@@ -49,13 +48,10 @@ from auditoria_comum import (
 
 # O balanceamento heuristico acusa falso positivo em massa nos fontes
 # gerados pelo AppBuilder (.w). Desligado por padrao.
+#
+# A validacao de sintaxe de verdade e a compilacao pelo OpenEdge, feita
+# por progress_compilador.py -- toda a configuracao dela esta la.
 BALANCEAMENTO = os.getenv("CHECAR_BALANCEAMENTO", "0") == "1"
-
-# Compilacao real: so roda com PROGRESS_COMPILE=1 e DLC apontando para uma
-# instalacao OpenEdge. E a unica validacao de sintaxe autoritativa.
-DLC = os.getenv("DLC")
-COMPILAR = os.getenv("PROGRESS_COMPILE", "0") == "1" and bool(DLC)
-PROPATH_EXTRA = os.getenv("PROPATH", "")
 
 
 # ==========================================================
@@ -349,88 +345,27 @@ def checar_balanceamento(arquivo, texto):
     ]
 
 
-def compilar_com_openedge(arquivos):
+def publicar_portao(status_compilacao, prosseguir):
     """
-    Compila os fontes alterados com o compilador OpenEdge, sem gerar r-code.
-    Requer PROGRESS_COMPILE=1 e DLC apontando para a instalacao.
+    Publica o resultado da compilacao em GITHUB_OUTPUT para o workflow
+    decidir se roda a etapa de IA.
     """
-    if not COMPILAR:
-        return []
-
-    progres = Path(DLC) / "bin" / "_progres"
-    if not progres.exists():
-        print(f"[aviso] _progres nao encontrado em {progres}; "
-              f"compilacao real ignorada.")
-        return []
-
-    alvos = [a for a in arquivos if Path(a).suffix.lower() != ".i"]
-    if not alvos:
-        return []
-
-    saida_json = REPO_ROOT / ".compile-result.json"
-    programa = REPO_ROOT / ".compile-check.p"
-
-    linhas_abl = [
-        "DEFINE VARIABLE cSaida AS LONGCHAR NO-UNDO.",
-        "DEFINE VARIABLE iMsg   AS INTEGER  NO-UNDO.",
-        'cSaida = "[".',
-    ]
-    for alvo in alvos:
-        alvo_abl = str(alvo).replace("\\", "/")
-        linhas_abl += [
-            f'COMPILE VALUE("{alvo_abl}") SAVE = FALSE NO-ERROR.',
-            "DO iMsg = 1 TO COMPILER:NUM-MESSAGES:",
-            '  IF cSaida <> "[" THEN cSaida = cSaida + ",".',
-            f'  cSaida = cSaida + \'~{{"file":"{alvo_abl}","line":\' +',
-            '    STRING(COMPILER:GET-ROW(iMsg)) + \',"message":"\' +',
-            "    REPLACE(REPLACE(COMPILER:GET-MESSAGE(iMsg), '\"', \"'\"), "
-            'CHR(10), " ") + \'"~}\'.',
-            "END.",
-        ]
-    linhas_abl += [
-        'cSaida = cSaida + "]".',
-        f'COPY-LOB cSaida TO FILE "{saida_json.as_posix()}".',
-        "QUIT.",
+    saida = os.getenv("GITHUB_OUTPUT")
+    linhas = [
+        f"compilacao_status={status_compilacao}",
+        f"prosseguir_ia={'true' if prosseguir else 'false'}",
     ]
 
-    programa.write_text("\n".join(linhas_abl), encoding="utf-8")
+    print(f"[portao] compilacao_status={status_compilacao}")
+    print(f"[portao] prosseguir_ia={'true' if prosseguir else 'false'}")
 
-    propath = ",".join(filter(None, [str(REPO_ROOT), PROPATH_EXTRA]))
-    env = dict(os.environ, DLC=DLC, PROPATH=propath)
+    if not saida:
+        print("[info] GITHUB_OUTPUT ausente (execucao local); "
+              "portao apenas registrado no log.")
+        return
 
-    try:
-        subprocess.run(
-            [str(progres), "-b", "-p", str(programa)],
-            cwd=str(REPO_ROOT), env=env, timeout=600,
-            capture_output=True, text=True,
-        )
-    except (subprocess.TimeoutExpired, OSError) as e:
-        print(f"[aviso] Falha ao executar o compilador: {e}")
-        return []
-    finally:
-        programa.unlink(missing_ok=True)
-
-    if not saida_json.exists():
-        print("[aviso] Compilador nao produziu resultado.")
-        return []
-
-    try:
-        mensagens = json.loads(ler_arquivo(saida_json) or "[]")
-    except json.JSONDecodeError:
-        mensagens = []
-    finally:
-        saida_json.unlink(missing_ok=True)
-
-    return [
-        achado(
-            "SINTAXE", "CRITICAL", "Erro de compilacao OpenEdge",
-            m.get("file", "?"), m.get("line", "?"),
-            m.get("message", ""),
-            "Corrija o erro apontado pelo compilador. Enquanto ele existir "
-            "o fonte nao gera r-code.",
-        )
-        for m in mensagens
-    ]
+    with open(saida, "a", encoding="utf-8") as f:
+        f.write("\n".join(linhas) + "\n")
 
 
 # ==========================================================
@@ -566,9 +501,17 @@ def main():
             print("[info] Balanceamento heuristico desligado "
                   "(CHECAR_BALANCEAMENTO=1 para habilitar).")
 
-        if COMPILAR:
-            with cronometro("compilacao OpenEdge"):
-                achados += compilar_com_openedge(arquivos_progress)
+        # Validacao de sintaxe pelo compilador OpenEdge. O resultado e o
+        # portao que libera (ou nao) a etapa de IA no workflow.
+        with cronometro("compilacao OpenEdge"):
+            status_compilacao, achados_compilacao = (
+                progress_compilador.compilar(arquivos_progress)
+            )
+            achados += achados_compilacao
+
+        prosseguir = progress_compilador.prosseguir_para_ia(
+            status_compilacao
+        )
 
         with cronometro("referencia cruzada"):
             achados_ref, impactos, externos = checar_referencia_cruzada(
@@ -581,23 +524,32 @@ def main():
               f"{len(externos)} distintos, {sum(externos.values())} usos")
 
         rodape = [
-            f"- Compilacao real OpenEdge: "
-            f"**{'habilitada' if COMPILAR else 'desabilitada'}**"
-            + ("" if COMPILAR else
-               " (defina `PROGRESS_COMPILE=1` e `DLC` para habilitar)")
-            + "\n",
+            f"- Compilacao OpenEdge: "
+            f"**{progress_compilador.diagnostico_configuracao()}**\n",
+            f"- Status da sintaxe: **{status_compilacao}**\n",
+            f"- Libera etapa de IA: "
+            f"**{'sim' if prosseguir else 'nao'}**\n",
             f"- Balanceamento heuristico: "
             f"**{'habilitado' if BALANCEAMENTO else 'desabilitado'}**\n",
             "- Analise por IA: **nao se aplica a este modo**\n\n",
-            "> A verificacao de balanceamento de blocos e heuristica. "
-            "Somente a compilacao pelo OpenEdge valida a sintaxe em "
-            "definitivo.\n",
+            "> Somente a compilacao pelo OpenEdge valida a sintaxe em "
+            "definitivo. O balanceamento de blocos e heuristico.\n",
         ]
 
-        return finalizar(
+        codigo = finalizar(
             achados, impactos, orfaos, indice, arquivos_progress,
             linhas_rodape=rodape,
         )
+
+        publicar_portao(status_compilacao, prosseguir)
+
+        # Erro de compilacao derruba o job: o PR nao deve seguir com fonte
+        # que nao compila, e a etapa de IA fica condicionada a este portao.
+        if status_compilacao == progress_compilador.STATUS_ERRO:
+            print("[erro] Compilacao falhou; PR nao segue para a IA.")
+            return 1
+
+        return codigo
 
     except Exception as e:
         print(f"[erro] Falha fatal: {e}")

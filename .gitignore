@@ -1,1 +1,15 @@
-.github/__pycache__
+# Cache do Python
+__pycache__/
+*.py[cod]
+
+# Artefatos gerados pela auditoria
+pr.diff
+code-check.md
+code-check-metrics.json
+code-check-ia.md
+code-check-ia-metrics.json
+
+# Temporarios do compilador Progress
+*.r
+.compile-check.p
+.compile-result.*
