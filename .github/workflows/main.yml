@@ -140,7 +140,20 @@ jobs:
       - name: Set up Python Dependencies
         if: steps.estatica.outputs.prosseguir_ia == 'true'
         run: |
-          pip3 install openai --break-system-packages --quiet
+          if python3 -c "import openai" 2>/dev/null; then
+            echo "openai ja presente: $(python3 -c 'import openai; print(openai.__version__)')"
+            exit 0
+          fi
+
+          if ! python3 -m pip --version >/dev/null 2>&1; then
+            echo "::error::pip nao esta instalado neste runner."
+            echo "Execute UMA VEZ no WSL, com a sua senha:"
+            echo "    sudo apt update && sudo apt install -y python3-pip"
+            exit 1
+          fi
+
+          python3 -m pip install openai --break-system-packages --quiet
+          echo "openai instalado: $(python3 -c 'import openai; print(openai.__version__)')"
 
       # 5. Auditoria por IA no Databricks -- so roda se a sintaxe passou.
       - name: Auditoria por IA (Databricks)
