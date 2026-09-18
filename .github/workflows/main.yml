@@ -52,13 +52,21 @@ jobs:
       # 2b. Materializa a chave SSH do servidor Progress a partir do secret.
       #     A chave nunca aparece no log: e escrita direto em arquivo com
       #     permissao 600 e apagada no fim do job.
+      #     O contexto 'secrets' nao existe em 'if:' de step -- por isso a
+      #     chave vem por env e o caso vazio e tratado aqui dentro.
       - name: Preparar chave SSH do servidor Progress
-        if: ${{ secrets.PROGRESS_SSH_KEY != '' }}
+        env:
+          CHAVE_SSH: ${{ secrets.PROGRESS_SSH_KEY }}
         run: |
+          if [ -z "$CHAVE_SSH" ]; then
+            echo "Secret PROGRESS_SSH_KEY nao definido."
+            echo "A compilacao em modo ssh ficara indisponivel."
+            exit 0
+          fi
+
           mkdir -p "$GITHUB_WORKSPACE/.ssh-progress"
           chmod 700 "$GITHUB_WORKSPACE/.ssh-progress"
-          printf '%s\n' "${{ secrets.PROGRESS_SSH_KEY }}" \
-            > "$GITHUB_WORKSPACE/.ssh-progress/id_rsa"
+          printf '%s\n' "$CHAVE_SSH" > "$GITHUB_WORKSPACE/.ssh-progress/id_rsa"
           chmod 600 "$GITHUB_WORKSPACE/.ssh-progress/id_rsa"
           echo "Chave gravada ($(wc -c < "$GITHUB_WORKSPACE/.ssh-progress/id_rsa") bytes)"
 
