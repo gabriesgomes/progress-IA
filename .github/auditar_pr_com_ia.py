@@ -57,6 +57,10 @@ DATABRICKS_MODEL = os.getenv("DATABRICKS_MODEL", "").strip()
 IA_TIMEOUT = int(os.getenv("IA_TIMEOUT", "300"))
 IA_MAX_TOKENS = int(os.getenv("IA_MAX_TOKENS", "4096"))
 
+# Modelos da familia GPT-5 rejeitam temperature diferente do padrao.
+# Deixe vazio para nao enviar o parametro; "0" para revisao deterministica.
+IA_TEMPERATURE = os.getenv("IA_TEMPERATURE", "").strip()
+
 
 def resolver_base_url(host):
     """
@@ -221,12 +225,10 @@ def analisar_com_ia(diff, contexto_includes):
         print(f"[info] Endpoint: {BASE_URL}")
         print(f"[info] Modelo  : {DATABRICKS_MODEL}")
 
-        inicio = time.perf_counter()
-        resposta = cliente.chat.completions.create(
-            model=DATABRICKS_MODEL,
-            temperature=0,
-            max_tokens=IA_MAX_TOKENS,
-            messages=[
+        parametros = {
+            "model": DATABRICKS_MODEL,
+            "max_tokens": IA_MAX_TOKENS,
+            "messages": [
                 {
                     "role": "system",
                     "content": "Voce e um especialista em Progress OpenEdge "
@@ -235,7 +237,18 @@ def analisar_com_ia(diff, contexto_includes):
                 },
                 {"role": "user", "content": prompt},
             ],
-        )
+        }
+
+        # Enviado apenas quando IA_TEMPERATURE tem valor: modelos GPT-5
+        # recusam o parametro com valor diferente do padrao.
+        if IA_TEMPERATURE:
+            parametros["temperature"] = float(IA_TEMPERATURE)
+            print(f"[info] temperature={IA_TEMPERATURE}")
+        else:
+            print("[info] temperature nao enviado (padrao do modelo)")
+
+        inicio = time.perf_counter()
+        resposta = cliente.chat.completions.create(**parametros)
         latencia = time.perf_counter() - inicio
 
         TELEMETRIA["ia"]["chamada"] = True
